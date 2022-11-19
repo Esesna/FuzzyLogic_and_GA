@@ -5,7 +5,9 @@
 ## Для проекта были использованы
 
 Ubuntu 18.04 LTS
+
 ROS melodic
+
 python 2.7
 
 Пакеты для python:

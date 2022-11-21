@@ -7,6 +7,14 @@ from geometry_msgs.msg import Twist
 from gazebo_msgs.msg import ModelState 
 from gazebo_msgs.srv import SetModelState, GetModelState
 from rosgraph_msgs.msg import Clock
+
+from deap import base
+from deap import creator
+from deap import tools
+from deap import base, algorithms
+
+import random
+
 import numpy as np
 import math
 from fuzzy_logic import FuzzyLogic
@@ -23,6 +31,7 @@ class Point():
 
 class Robot:
     def __init__(self):
+        self.pub = rospy.Publisher("/cmd_vel", Twist)
         self.fuzzy_logic = FuzzyLogic()
         self.target = Point(0, 0)
         self.vel_msg = Twist()
@@ -32,6 +41,8 @@ class Robot:
         self.READY = True
         self.START = False
         self.STOP = False
+        self.reward = 0
+
     def setTarget(self, P):
         self.target = P
 
@@ -46,8 +57,8 @@ class Robot:
         self.timeMS = data.clock.nsecs / (1000 * 1000) + data.clock.secs * 1000
 
     def listener(self):
-        rospy.Subscriber("/two_wheel_robot/laser/scan", LaserScan, self.callbackLaser)
-        rospy.Subscriber("/clock", Clock, self.callbackTime)
+        rospy.Subscriber("/two_wheel_robot/laser/scan", LaserScan, self.callbackLaser, queue_size = 1)
+        rospy.Subscriber("/clock", Clock, self.callbackTime, queue_size = 1)
         
     def updateModelState(self):
 
@@ -83,8 +94,20 @@ class Robot:
         return angle / math.pi * 180
 
     def talker(self, event):
-        pub = rospy.Publisher("/cmd_vel", Twist)
-        pub.publish(self.vel_msg)
+        self.pub.publish(self.vel_msg)
+
+    def setNullSpeed(self):
+        self.vel_msg.angular.x = 0
+        self.vel_msg.angular.y = 0
+        self.vel_msg.angular.z = 0
+
+        self.vel_msg.linear.x = 0
+        self.vel_msg.linear.y = 0
+        self.vel_msg.linear.z = 0
+        self.vel_msg.linear.w = 0
+
+        self.pub.publish(self.vel_msg)
+
 
     def startDefaultModel(self, Ps):
         state_msg = ModelState()
@@ -97,7 +120,9 @@ class Robot:
         state_msg.pose.orientation.y = 0
         state_msg.pose.orientation.z = 0
         state_msg.pose.orientation.w = 0
-
+        self.READY = True
+        self.START = False
+        self.STOP = False
         rospy.wait_for_service('/gazebo/set_model_state')
         try:
             set_state = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
@@ -106,16 +131,23 @@ class Robot:
         except rospy.ServiceException as e:
             print("Service call failed: %s" % e)
 
-    def endCondition(self, distance):
-        if(distance < 0.05):
+    def endCondition(self, distance, time):
+        if(time > 72000):
+            self.reward = 0
             return True
-        else:
-            return False
+
+        if(distance < 0.05):
+            self.reward = 72000 - time
+            return True
+
+        return False
 
     def control(self):
-        min_right = self.laser_data[0:12].min()
-        min_front = self.laser_data[12:24].min()
-        min_left = self.laser_data[24:36].min()
+
+        start = time.time()
+        min_right = self.laser_data[0:8].min()
+        min_front = self.laser_data[8:28].min()
+        min_left = self.laser_data[28:36].min()
 
         newP = self.target - self.Pos2d
         angle = self.angleVector(newP) - self.angleR
@@ -137,13 +169,16 @@ class Robot:
                 min_right = 2
             vel, rot = self.fuzzy_logic.computeOAFLC(min_left, min_front, min_right)
 
+        finish = time.time()
 
         os.system('cls||clear')
         print("Input: ", min_right, min_front, min_left)
         print("Path to: ", angle, distance)
         print("Output: ", vel, rot)
         print("Time: ", self.timeMS - self.timeStartMS, " ms")
-        if(self.endCondition(distance)):
+        print("Time for ",finish - start)
+
+        if(self.endCondition(distance, self.timeMS - self.timeStartMS)):
             if(not self.STOP):
                 self.STOP = True
                 self.finishTime = self.timeMS - self.timeStartMS
@@ -154,6 +189,7 @@ class Robot:
         else:
             self.vel_msg.linear.x = vel
             self.vel_msg.angular.z = rot
+
         if(not self.START and self.READY):
             self.START = True
             self.READY = False
@@ -161,15 +197,68 @@ class Robot:
 
 
 def main():
+
+    # INIT ROBOT
     rospy.init_node("Control_robot")
     robot = Robot()
-    robot.setTarget(Point(5, 0))
+    robot.setTarget(Point(1, 0))
     robot.startDefaultModel(Point(-8, 0))
 
     timer = rospy.Timer(rospy.Duration(0.5), robot.talker)
 
     robot.listener()
     # time.sleep(100000)
+    def Run(listBit):
+        robot.fuzzy_logic.reInit(listBit)
+        robot.startDefaultModel(Point(-8, 0))
+        while(not robot.STOP):
+            time.sleep(0.1)
+        return (robot.reward, )
+
+    # INIT GA
+    ONE_MAX_LENGTH = robot.fuzzy_logic.n * robot.fuzzy_logic.countParam # Size list bit
+    POPULATION_SIZE = 20 # Size population
+    P_CROSSOVER = 0.9
+    P_MUTATION = 0.1
+    MAX_GENERATIONS = 20
+    # creator.create("Point", object, MAX_COORD = 10, MIN_COORD = 0, coords=list)
+
+    # pt = creator.Point()
+    creator.create("FitnessMax", base.Fitness, weights = (1.0, ))
+    creator.create("Individual", list, fitness = creator.FitnessMax)
+
+
+    toolbox = base.Toolbox()
+    toolbox.register("randRange", random.randint, 0, 1)
+    toolbox.register("individualCreator", tools.initRepeat, creator.Individual, toolbox.randRange, ONE_MAX_LENGTH)
+    toolbox.register("populationCreator", tools.initRepeat, list, toolbox.individualCreator)
+
+    population = toolbox.populationCreator(n=POPULATION_SIZE)
+
+    np.savetxt("first_population.csv", population, delimiter=",")
+
+    toolbox.register("select", tools.selTournament, tournsize=3)
+    toolbox.register("mate", tools.cxOnePoint)
+    toolbox.register("mutate", tools.mutFlipBit, indpb=1.0/ONE_MAX_LENGTH)
+    toolbox.register("evaluate", Run)
+
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
+    stats.register("max", np.max)
+    stats.register("avg", np.mean)
+
+    population, logbook = algorithms.eaSimple(population, toolbox,
+                                            cxpb=P_CROSSOVER,
+                                            mutpb=P_MUTATION,
+                                            ngen=MAX_GENERATIONS,
+                                            stats=stats,
+                                            verbose=True)
+
+    maxFitnessValues, meanFitnessValues = logbook.select("max", "avg")
+    
+    np.savetxt("maxFitnessValues.csv", maxFitnessValues, delimiter=",")
+    np.savetxt("meanFitnessValues.csv", meanFitnessValues, delimiter=",")
+    np.savetxt("population.csv", population, delimiter=",")
+
     rospy.spin()
     timer.shutdown()
 
